@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<evaluation name="nebula3-mcp-remote-readonly" space="basketballplayer">
+  <qa_pair id="schema-01" fact_key="vid_type">
+    <question>basketballplayer 图空间的 VID 类型是什么？</question>
+    <expected_answer>FIXED_STRING(32)</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-02" fact_key="tag_count">
+    <question>该图空间声明了多少个 Tag？</question>
+    <expected_answer>2</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-03" fact_key="tag_names">
+    <question>按名称排序后，Tag 分别是什么？</question>
+    <expected_answer>player,team</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-04" fact_key="player_properties">
+    <question>player Tag 的属性（按名称排序）是什么？</question>
+    <expected_answer>age,name</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-05" fact_key="player_age_type">
+    <question>player.age 的数据类型是什么？</question>
+    <expected_answer>int64</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-06" fact_key="team_property_count">
+    <question>team Tag 声明了多少个属性？</question>
+    <expected_answer>1</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-07" fact_key="edge_count">
+    <question>该图空间声明了多少个 Edge Type？</question>
+    <expected_answer>2</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-08" fact_key="edge_names">
+    <question>按名称排序后，Edge Type 分别是什么？</question>
+    <expected_answer>follow,serve</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-09" fact_key="follow_properties">
+    <question>follow 边的属性是什么？</question>
+    <expected_answer>degree</expected_answer>
+  </qa_pair>
+  <qa_pair id="schema-10" fact_key="serve_properties">
+    <question>serve 边的属性（按名称排序）是什么？</question>
+    <expected_answer>end_year,start_year</expected_answer>
+  </qa_pair>
+  <workflow_case id="explicit-ngql-scalar">
+    <request>执行用户提供的单条只读 nGQL 标量语句。</request>
+    <expected_tool_sequence>nebula_validate_ngql -&gt; nebula_execute_query</expected_tool_sequence>
+    <final_answer_invariant>原语句不得为了生成图而改写；展示 query.display_statement、标量结果和基于事实的解释，标量或空图由 nebula_render_result 展示表格。</final_answer_invariant>
+  </workflow_case>
+  <workflow_case id="natural-language-graph">
+    <request>用自然语言查询实体及其关系，并要求直观看图。</request>
+    <expected_tool_sequence>nebula_list_spaces -&gt; nebula_get_space_schema -&gt; ngql-skills -&gt; nebula_validate_ngql -&gt; nebula_execute_query -&gt; nebula_render_result</expected_tool_sequence>
+    <final_answer_invariant>图空间明确、无占位符且只读校验通过后才自动执行；展示实际 nGQL，并同时呈现非空图、图表、表格和事实解释。</final_answer_invariant>
+  </workflow_case>
+  <workflow_case id="natural-language-aggregate">
+    <request>用自然语言请求按类别聚合的数值统计。</request>
+    <expected_tool_sequence>nebula_list_spaces -&gt; nebula_get_space_schema -&gt; ngql-skills -&gt; nebula_validate_ngql -&gt; nebula_execute_query</expected_tool_sequence>
+    <final_answer_invariant>保留聚合意图，不为补图强行投影顶点或边；展示实际 nGQL、表格、所有非空图表和事实解释。</final_answer_invariant>
+  </workflow_case>
+  <workflow_case id="follow-up-query">
+    <request>根据上一查询返回的 VID，查询指定顶点的关系。</request>
+    <expected_tool_sequence>nebula_execute_query</expected_tool_sequence>
+    <final_answer_invariant>图内点击只展示 VID、Tag 和属性，不执行额外查询；后续请求生成独立的只读 nGQL（如 GO FROM 该 VID），解释具体关系及结果边界。</final_answer_invariant>
+  </workflow_case>
+</evaluation>

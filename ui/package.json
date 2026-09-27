@@ -1,0 +1,23 @@
+{
+  "name": "nebula3-mcp-ui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && node scripts/verify-build.mjs",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "cytoscape": "3.34.2",
+    "vega-embed": "7.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "26.4.0",
+    "jsdom": "30.0.1",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vite-plugin-singlefile": "2.3.3",
+    "vitest": "4.1.11"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "name": "nebula3-mcp-local",
+  "interface": {
+    "displayName": "Nebula3 MCP Local"
+  },
+  "plugins": [
+    {
+      "name": "nebula3-mcp",
+      "source": {
+        "source": "local",
+        "path": "./plugins/nebula3-mcp"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Developer Tools"
+    }
+  ]
+}

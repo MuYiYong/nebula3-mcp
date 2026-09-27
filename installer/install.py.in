@@ -1,0 +1,2315 @@
+from __future__ import annotations
+
+import argparse
+import getpass
+import hashlib
+import hmac
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
+from typing import Literal
+from zipfile import BadZipFile, ZipFile
+
+TARGET_REPOSITORY = "__NEBULA3_MCP_REPOSITORY__"
+TARGET_VERSION = "__NEBULA3_MCP_VERSION__"
+TARGET_TAG = f"v{TARGET_VERSION}"
+SERVER_NAME = "nebula3"
+PLUGIN_NAME = "nebula3-mcp"
+MARKETPLACE_NAME = "nebula3-mcp-local"
+PLUGIN_REFERENCE = f"{PLUGIN_NAME}@{MARKETPLACE_NAME}"
+MINIMUM_PYTHON = (3, 10)
+MAX_ASSET_BYTES = 512 * 1024 * 1024
+OWNERSHIP_MARKER = ".nebula3-mcp-managed"
+OWNERSHIP_MARKER_CONTENT = "nebula3-mcp installer ownership\nschema=1\n"
+LAUNCHER_CONTENT = """from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+
+def main() -> None:
+    root = Path(__file__).resolve().parent
+    state = json.loads((root / \"state.json\").read_text(encoding=\"utf-8\"))
+    python = Path(state[\"python\"])
+    managed_python = python.parent.resolve() / python.name
+    if not managed_python.is_relative_to(root / \"versions\") or not python.is_file():
+        raise SystemExit(\"nebula3-mcp installation state is invalid\")
+    os.execv(str(python), [str(python), \"-m\", \"nebula3_mcp\"])
+
+
+if __name__ == \"__main__\":
+    main()
+"""
+
+CodexCommand = tuple[str, ...]
+RegistrationKind = Literal["absent", "managed", "conflict"]
+InstallMode = Literal["plugin", "mcp"]
+
+PLUGIN_ARCHIVE_MEMBERS = {
+    ".codex-plugin/plugin.json",
+    ".mcp.json",
+    "README.md",
+}
+GENERIC_PLUGIN_MCP = {
+    "mcpServers": {SERVER_NAME: {"command": "nebula3-mcp", "args": []}}
+}
+CONNECTION_ENVIRONMENT = (
+    "NEBULA_ADDRESSES",
+    "NEBULA_USERNAME",
+    "NEBULA_PASSWORD",
+    "NEBULA_CONNECT_TIMEOUT_MS",
+    "NEBULA_ALLOW_MUTATIONS",
+)
+NEW_REGISTRATION_ENVIRONMENT = {
+    "NEBULA_ADDRESSES": "",
+    "NEBULA_USERNAME": "",
+    "NEBULA_PASSWORD": "",
+    "NEBULA_CONNECT_TIMEOUT_MS": "30000",
+    "NEBULA_ALLOW_MUTATIONS": "false",
+    "NEBULA_ENVIRONMENT": "default",
+}
+
+_CHECKSUM_LINE = re.compile(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._+-]*)$")
+_RELEASE_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]*$")
+
+
+class InstallerError(Exception):
+    def __init__(self, stage: str, message: str, next_step: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+        self.message = message
+        self.next_step = next_step
+
+
+@dataclass(frozen=True)
+class ManagedPaths:
+    root: Path
+    versions: Path
+    staging: Path
+    launcher: Path
+    state: Path
+    logs: Path
+
+    @property
+    def ownership_marker(self) -> Path:
+        return self.root / OWNERSHIP_MARKER
+
+    @property
+    def marketplace_root(self) -> Path:
+        return self.root / "marketplace"
+
+    @property
+    def plugin_root(self) -> Path:
+        return self.marketplace_root / "plugins" / PLUGIN_NAME
+
+    @property
+    def marketplace_manifest(self) -> Path:
+        return self.marketplace_root / ".agents" / "plugins" / "marketplace.json"
+
+
+@dataclass(frozen=True)
+class InstallState:
+    schema_version: int
+    version: str
+    python: str
+
+
+def _error(stage: str, message: str, next_step: str) -> InstallerError:
+    return InstallerError(stage, message, next_step)
+
+
+def _canonicalize_parent(path: Path) -> Path:
+    missing: list[str] = []
+    candidate = path
+    while True:
+        try:
+            candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+            break
+        except FileNotFoundError:
+            if candidate.parent == candidate:
+                raise
+            missing.append(candidate.name)
+            candidate = candidate.parent
+    for component in reversed(missing):
+        resolved /= component
+    return resolved
+
+
+def resolve_data_root(
+    *,
+    platform_name: str | None = None,
+    env: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> Path:
+    platform = platform_name or sys.platform
+    environment = os.environ if env is None else env
+    user_home = (Path.home() if home is None else home).expanduser()
+
+    if platform == "darwin":
+        root = user_home / "Library/Application Support/nebula3-mcp"
+    elif platform == "win32":
+        local_app_data = environment.get("LOCALAPPDATA")
+        if not local_app_data:
+            raise _error(
+                "paths",
+                "LOCALAPPDATA is required to choose the installation directory",
+                "Set LOCALAPPDATA and run the installer again.",
+            )
+        local_app_data_path = Path(local_app_data).expanduser()
+        if not local_app_data_path.is_absolute():
+            raise _error(
+                "paths",
+                "LOCALAPPDATA must be an absolute current-user directory",
+                "Restore the current-user LOCALAPPDATA value and retry.",
+            )
+        root = local_app_data_path / "nebula3-mcp"
+    else:
+        data_home = environment.get("XDG_DATA_HOME")
+        root = (
+            Path(data_home).expanduser() if data_home else user_home / ".local/share"
+        ) / "nebula3-mcp"
+    try:
+        return _canonicalize_parent(root.parent) / root.name
+    except (OSError, RuntimeError) as exc:
+        raise _error(
+            "paths",
+            "could not resolve the installation directory parent",
+            "Inspect the user data directory and run the installer again.",
+        ) from exc
+
+
+def managed_paths(root: Path) -> ManagedPaths:
+    expanded = root.expanduser()
+    try:
+        resolved = _canonicalize_parent(expanded.parent) / expanded.name
+    except (OSError, RuntimeError) as exc:
+        raise _error(
+            "paths",
+            "could not resolve the installation directory parent",
+            "Inspect the user data directory and run the installer again.",
+        ) from exc
+    return ManagedPaths(
+        root=resolved,
+        versions=resolved / "versions",
+        staging=resolved / "staging",
+        launcher=resolved / "launcher.py",
+        state=resolved / "state.json",
+        logs=resolved / "logs",
+    )
+
+
+def _root_lstat(paths: ManagedPaths, *, stage: str) -> os.stat_result | None:
+    try:
+        return paths.root.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise _error(
+            stage,
+            "could not inspect the managed installation root",
+            "Inspect the user data directory and run the installer again.",
+        ) from exc
+
+
+def _is_windows_reparse_point(
+    file_attributes: int, *, platform_name: str | None = None
+) -> bool:
+    platform = os.name if platform_name is None else platform_name
+    return platform == "nt" and bool(file_attributes & 0x400)
+
+
+def _is_name_surrogate(path: Path, metadata: os.stat_result) -> bool:
+    if stat.S_ISLNK(metadata.st_mode):
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if callable(is_junction) and is_junction():
+        return True
+    return _is_windows_reparse_point(getattr(metadata, "st_file_attributes", 0))
+
+
+def _reject_root_leaf_symlink(paths: ManagedPaths, *, stage: str) -> os.stat_result | None:
+    metadata = _root_lstat(paths, stage=stage)
+    try:
+        invalid_leaf = metadata is not None and _is_name_surrogate(paths.root, metadata)
+    except OSError as exc:
+        raise _error(
+            stage,
+            "could not inspect the managed installation root",
+            "Inspect the user data directory and run the installer again.",
+        ) from exc
+    if invalid_leaf:
+        raise _error(
+            stage,
+            "the managed installation root must not be a symbolic link or reparse point",
+            "Remove the link without deleting its target, then retry.",
+        )
+    return metadata
+
+
+def _secure_posix_directory(path: Path, *, stage: str) -> None:
+    if os.name == "nt":
+        return
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise OSError("not a regular directory")
+        if metadata.st_uid != os.getuid():
+            raise _error(
+                stage,
+                "the managed directory is not owned by the current user",
+                "Move it aside or restore current-user ownership before retrying.",
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o700:
+            os.chmod(path, 0o700)
+        secured = path.lstat()
+    except InstallerError:
+        raise
+    except OSError as exc:
+        raise _error(
+            stage,
+            "could not secure the managed directory",
+            "Check ownership and permissions, then retry.",
+        ) from exc
+    if secured.st_uid != os.getuid() or stat.S_IMODE(secured.st_mode) != 0o700:
+        raise _error(
+            stage,
+            "the managed directory is not private to the current user",
+            "Restore current-user ownership and mode 0700, then retry.",
+        )
+
+
+def _secure_posix_file(path: Path, *, stage: str) -> None:
+    if os.name == "nt":
+        return
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise OSError("not a regular file")
+        if metadata.st_uid != os.getuid():
+            raise _error(
+                stage,
+                "the managed file is not owned by the current user",
+                "Move it aside or restore current-user ownership before retrying.",
+            )
+        if stat.S_IMODE(metadata.st_mode) != 0o600:
+            os.chmod(path, 0o600)
+        secured = path.lstat()
+    except InstallerError:
+        raise
+    except OSError as exc:
+        raise _error(
+            stage,
+            "could not secure a managed file",
+            "Check ownership and permissions, then retry.",
+        ) from exc
+    if secured.st_uid != os.getuid() or stat.S_IMODE(secured.st_mode) != 0o600:
+        raise _error(
+            stage,
+            "a managed file is not private to the current user",
+            "Restore current-user ownership and mode 0600, then retry.",
+        )
+
+
+def _atomic_create_ownership_marker(paths: ManagedPaths, *, stage: str) -> None:
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=paths.root,
+            delete=False,
+            prefix=".ownership-",
+        ) as output:
+            temporary = Path(output.name)
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+            output.write(OWNERSHIP_MARKER_CONTENT)
+            output.flush()
+            os.fsync(output.fileno())
+        os.link(temporary, paths.ownership_marker)
+    except OSError as exc:
+        raise _error(
+            stage,
+            "could not create the managed-root ownership marker",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _read_regular_text(path: Path, *, stage: str, description: str) -> str:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or _is_name_surrogate(path, metadata):
+            raise OSError("not a regular file")
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise _error(
+            stage,
+            f"the {description} is invalid",
+            "Inspect the installation directory before retrying.",
+        ) from exc
+
+
+def _require_confined_real_directory(
+    path: Path, *, root: Path, stage: str
+) -> None:
+    try:
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or _is_name_surrogate(path, metadata):
+            raise OSError("not a regular directory")
+        resolved = path.resolve(strict=True)
+        if not resolved.is_relative_to(root.resolve(strict=True)):
+            raise OSError("directory is outside the managed root")
+    except (OSError, RuntimeError) as exc:
+        raise _error(
+            stage,
+            "the markerless installation does not have a trusted managed identity",
+            "Move the existing files aside or choose a clean user data directory.",
+        ) from exc
+
+
+def _require_legacy_python_leaf(path: Path, *, stage: str) -> None:
+    try:
+        metadata = path.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            if not stat.S_ISREG(path.stat().st_mode):
+                raise OSError("Python symlink target is not a regular file")
+        elif not stat.S_ISREG(metadata.st_mode) or _is_name_surrogate(path, metadata):
+            raise OSError("Python path is not a regular file")
+    except (OSError, RuntimeError) as exc:
+        raise _error(
+            stage,
+            "the markerless installation has an invalid version entry",
+            "Move the existing files aside or choose a clean user data directory.",
+        ) from exc
+
+
+def _validate_legacy_managed_root(
+    paths: ManagedPaths, entries: Sequence[Path], *, stage: str
+) -> None:
+    names = {entry.name for entry in entries}
+    required = {"versions", "launcher.py", "state.json"}
+    allowed = required | {"logs", "staging"}
+    if not required.issubset(names) or not names.issubset(allowed):
+        raise _error(
+            stage,
+            "the non-empty installation root has no trusted ownership marker",
+            "Move the existing files aside or choose a clean user data directory.",
+        )
+    if _read_regular_text(
+        paths.launcher,
+        stage=stage,
+        description="markerless installation launcher",
+    ) != LAUNCHER_CONTENT:
+        raise _error(
+            stage,
+            "the markerless installation launcher is not managed by this installer",
+            "Move the existing files aside or choose a clean user data directory.",
+        )
+    state = read_state(paths, secure=False)
+    assert state is not None
+    if state.schema_version != 1:
+        raise _error(
+            stage,
+            "the markerless installation state is not managed by this installer",
+            "Move the existing files aside or choose a clean user data directory.",
+        )
+    validate_installed_python(paths, state)
+    _require_confined_real_directory(paths.versions, root=paths.root, stage=stage)
+    try:
+        versions = list(paths.versions.iterdir())
+    except OSError as exc:
+        raise _error(
+            stage,
+            "the markerless installation does not have a trusted managed identity",
+            "Move the existing files aside or choose a clean user data directory.",
+        ) from exc
+    if not versions or not any(version.name == state.version for version in versions):
+        raise _error(
+            stage,
+            "the markerless installation does not have a trusted managed identity",
+            "Move the existing files aside or choose a clean user data directory.",
+        )
+    for version in versions:
+        if _RELEASE_VERSION.fullmatch(version.name) is None:
+            raise _error(
+                stage,
+                "the markerless installation has an unknown version entry",
+                "Move the existing files aside or choose a clean user data directory.",
+            )
+        _require_confined_real_directory(version, root=paths.root, stage=stage)
+        venv = version / "venv"
+        _require_confined_real_directory(venv, root=paths.root, stage=stage)
+        version_python = python_in_venv(venv)
+        _require_confined_real_directory(
+            version_python.parent,
+            root=paths.root,
+            stage=stage,
+        )
+        _require_legacy_python_leaf(version_python, stage=stage)
+    if paths.logs.name in names:
+        _require_confined_real_directory(paths.logs, root=paths.root, stage=stage)
+        try:
+            logs = list(paths.logs.iterdir())
+            valid_logs = all(
+                log.name.startswith("install-")
+                and log.name.endswith(".log")
+                and stat.S_ISREG(log.lstat().st_mode)
+                and not _is_name_surrogate(log, log.lstat())
+                for log in logs
+            )
+        except OSError as exc:
+            raise _error(
+                stage,
+                "the markerless installation has invalid log entries",
+                "Move the existing files aside or choose a clean user data directory.",
+            ) from exc
+        if not valid_logs:
+            raise _error(
+                stage,
+                "the markerless installation has invalid log entries",
+                "Move the existing files aside or choose a clean user data directory.",
+            )
+    if paths.staging.name in names:
+        _require_confined_real_directory(paths.staging, root=paths.root, stage=stage)
+        try:
+            staging_is_empty = next(paths.staging.iterdir(), None) is None
+        except OSError as exc:
+            raise _error(
+                stage,
+                "the markerless installation staging directory is invalid",
+                "Move the existing files aside or choose a clean user data directory.",
+            ) from exc
+        if not staging_is_empty:
+            raise _error(
+                stage,
+                "the markerless installation staging directory is not empty",
+                "Move the existing files aside or choose a clean user data directory.",
+            )
+
+
+def initialize_managed_root(paths: ManagedPaths, *, stage: str = "install") -> None:
+    metadata = _reject_root_leaf_symlink(paths, stage=stage)
+    if metadata is None:
+        try:
+            paths.root.mkdir(mode=0o700, parents=True)
+        except OSError as exc:
+            raise _error(
+                stage,
+                "could not create the managed installation root",
+                "Check the user data directory permissions and try again.",
+            ) from exc
+        metadata = _reject_root_leaf_symlink(paths, stage=stage)
+    if metadata is None or not stat.S_ISDIR(metadata.st_mode):
+        raise _error(
+            stage,
+            "the managed installation root is not a directory",
+            "Inspect the user data directory and run the installer again.",
+        )
+    if os.name != "nt" and metadata.st_uid != os.getuid():
+        raise _error(
+            stage,
+            "the managed installation root is not owned by the current user",
+            "Move it aside or restore current-user ownership before retrying.",
+        )
+
+    marker = paths.ownership_marker
+    try:
+        marker_metadata = marker.lstat()
+    except FileNotFoundError:
+        try:
+            entries = list(paths.root.iterdir())
+        except OSError as exc:
+            raise _error(
+                stage,
+                "could not inspect managed-root ownership",
+                "Check the installation directory permissions and try again.",
+            ) from exc
+        if entries:
+            _validate_legacy_managed_root(paths, entries, stage=stage)
+        _atomic_create_ownership_marker(paths, stage=stage)
+        try:
+            marker_metadata = marker.lstat()
+        except OSError as exc:
+            raise _error(
+                stage,
+                "could not inspect managed-root ownership",
+                "Check the installation directory permissions and try again.",
+            ) from exc
+    except OSError as exc:
+        raise _error(
+            stage,
+            "could not inspect managed-root ownership",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+
+    try:
+        invalid_marker = not stat.S_ISREG(
+            marker_metadata.st_mode
+        ) or _is_name_surrogate(marker, marker_metadata)
+    except OSError as exc:
+        raise _error(
+            stage,
+            "could not inspect managed-root ownership",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+    if invalid_marker:
+        raise _error(
+            stage,
+            "the managed-root ownership marker is invalid",
+            "Inspect the installation directory before retrying.",
+        )
+    try:
+        marker_content = marker.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise _error(
+            stage,
+            "the managed-root ownership marker is invalid",
+            "Inspect the installation directory before retrying.",
+        ) from exc
+    if marker_content != OWNERSHIP_MARKER_CONTENT:
+        raise _error(
+            stage,
+            "the managed-root ownership marker is invalid",
+            "Inspect the installation directory before retrying.",
+        )
+    _secure_posix_directory(paths.root, stage=stage)
+    _secure_posix_file(marker, stage=stage)
+
+
+def _is_loopback_http(url: urllib.parse.ParseResult) -> bool:
+    return url.hostname in {"127.0.0.1", "localhost"}
+
+
+def _validate_download_url(url: str, *, allow_http: bool) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "https" and parsed.hostname:
+        return
+    if parsed.scheme == "http" and allow_http and _is_loopback_http(parsed):
+        return
+    raise _error(
+        "download",
+        "release downloads must use HTTPS",
+        "Run the official HTTPS installation command again.",
+    )
+
+
+class ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, *, allow_http: bool) -> None:
+        super().__init__()
+        self.allow_http = allow_http
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: object,
+        code: int,
+        msg: str,
+        headers: object,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        _validate_download_url(newurl, allow_http=self.allow_http)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download_file(url: str, destination: Path, *, allow_http: bool = False) -> None:
+    _validate_download_url(url, allow_http=allow_http)
+    temporary: Path | None = None
+    try:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        opener = urllib.request.build_opener(ValidatingRedirectHandler(allow_http=allow_http))
+        with opener.open(url, timeout=30) as response:
+            _validate_download_url(response.geturl(), allow_http=allow_http)
+            status = response.getcode()
+            if status is None or not 200 <= status < 300:
+                raise _error(
+                    "download",
+                    "release download returned an unsuccessful response",
+                    "Try the installation again later.",
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length is None:
+                raise _error(
+                    "download",
+                    "release download did not include Content-Length",
+                    "Try the installation again later.",
+                )
+            try:
+                expected_size = int(content_length)
+            except ValueError as exc:
+                raise _error(
+                    "download",
+                    "release download included an invalid Content-Length",
+                    "Try the installation again later.",
+                ) from exc
+            if expected_size < 0 or expected_size > MAX_ASSET_BYTES:
+                raise _error(
+                    "download",
+                    "release asset exceeds the maximum allowed size",
+                    "Verify the release asset and try again.",
+                )
+
+            with tempfile.NamedTemporaryFile(
+                "wb", dir=destination.parent, delete=False, prefix=".download-"
+            ) as output:
+                temporary = Path(output.name)
+                actual_size = 0
+                while chunk := response.read(1024 * 1024):
+                    actual_size += len(chunk)
+                    if actual_size > MAX_ASSET_BYTES:
+                        raise _error(
+                            "download",
+                            "release asset exceeds the maximum allowed size",
+                            "Verify the release asset and try again.",
+                        )
+                    output.write(chunk)
+                output.flush()
+                os.fsync(output.fileno())
+            if actual_size != expected_size:
+                raise _error(
+                    "download",
+                    "release download length did not match Content-Length",
+                    "Try the installation again later.",
+                )
+            os.replace(temporary, destination)
+            temporary = None
+    except InstallerError:
+        raise
+    except (OSError, urllib.error.URLError, ValueError) as exc:
+        raise _error(
+            "download",
+            "could not download the release asset",
+            "Check your network connection and try again.",
+        ) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def parse_checksums(manifest: str) -> dict[str, str]:
+    checksums: dict[str, str] = {}
+    for line in manifest.splitlines():
+        match = _CHECKSUM_LINE.fullmatch(line)
+        if match is None:
+            raise _error(
+                "checksum",
+                "checksum manifest is invalid",
+                "Download the release manifest again.",
+            )
+        digest, name = match.groups()
+        if name in checksums:
+            raise _error(
+                "checksum",
+                "checksum manifest is invalid",
+                "Download the release manifest again.",
+            )
+        checksums[name] = digest
+    if not checksums:
+        raise _error(
+            "checksum",
+            "checksum manifest is invalid",
+            "Download the release manifest again.",
+        )
+    return checksums
+
+
+def verify_sha256(asset: Path, expected: str) -> None:
+    if re.fullmatch(r"[0-9a-f]{64}", expected) is None:
+        raise _error(
+            "checksum",
+            "checksum manifest is invalid",
+            "Download the release manifest again.",
+        )
+    digest = hashlib.sha256()
+    try:
+        with asset.open("rb") as source:
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+    except OSError as exc:
+        raise _error(
+            "checksum",
+            "could not read the release asset for checksum verification",
+            "Download the release asset again.",
+        ) from exc
+    if not hmac.compare_digest(digest.hexdigest(), expected):
+        raise _error(
+            "checksum",
+            "release asset checksum did not match",
+            "Download the release asset again.",
+        )
+
+
+def _plugin_archive_error() -> InstallerError:
+    return _error(
+        "plugin",
+        "plugin archive is invalid or unsafe",
+        "Download the matching official plugin archive and retry.",
+    )
+
+
+def _validate_plugin_member(info: object) -> str:
+    filename = getattr(info, "filename", None)
+    if not isinstance(filename, str):
+        raise _plugin_archive_error()
+    path = PurePosixPath(filename)
+    mode = int(getattr(info, "external_attr", 0)) >> 16
+    file_type = stat.S_IFMT(mode)
+    if (
+        filename not in PLUGIN_ARCHIVE_MEMBERS
+        or path.is_absolute()
+        or ".." in path.parts
+        or filename.endswith("/")
+        or file_type not in {0, stat.S_IFREG}
+    ):
+        raise _plugin_archive_error()
+    return filename
+
+
+def extract_plugin_archive(archive: Path, staging_root: Path) -> Path:
+    """Extract only the three regular allowlisted plugin files."""
+
+    try:
+        with ZipFile(archive) as source:
+            infos = source.infolist()
+            names = [_validate_plugin_member(info) for info in infos]
+            if len(names) != len(set(names)) or set(names) != PLUGIN_ARCHIVE_MEMBERS:
+                raise _plugin_archive_error()
+            if sum(info.file_size for info in infos) > MAX_ASSET_BYTES:
+                raise _plugin_archive_error()
+            plugin_root = staging_root / "plugins" / PLUGIN_NAME
+            for info, name in zip(infos, names, strict=True):
+                destination = plugin_root.joinpath(*PurePosixPath(name).parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with source.open(info) as input_stream, destination.open("wb") as output:
+                    shutil.copyfileobj(input_stream, output)
+    except InstallerError:
+        raise
+    except (BadZipFile, OSError, RuntimeError, ValueError) as exc:
+        raise _plugin_archive_error() from exc
+    return plugin_root
+
+
+def _read_plugin_json(path: Path) -> dict[str, object]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _plugin_archive_error() from exc
+    if not isinstance(payload, dict):
+        raise _plugin_archive_error()
+    return payload
+
+
+def render_managed_mcp_config(
+    plugin_root: Path,
+    python: Path,
+    launcher: Path,
+) -> None:
+    """Replace only the generic plugin command with managed absolute paths."""
+
+    if not python.is_absolute() or not launcher.is_absolute():
+        raise _plugin_archive_error()
+    destination = plugin_root / ".mcp.json"
+    mapping = _read_plugin_json(destination)
+    if mapping != GENERIC_PLUGIN_MCP:
+        raise _plugin_archive_error()
+    managed = {
+        "mcpServers": {
+            SERVER_NAME: {
+                "command": str(python),
+                "args": [str(launcher)],
+            }
+        }
+    }
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            dir=plugin_root,
+            delete=False,
+            prefix=".mcp-",
+        ) as output:
+            temporary = Path(output.name)
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+            json.dump(managed, output, separators=(",", ":"))
+            output.flush()
+            os.fsync(output.fileno())
+        if _read_plugin_json(temporary) != managed:
+            raise _plugin_archive_error()
+        os.replace(temporary, destination)
+        temporary = None
+    except InstallerError:
+        raise
+    except OSError as exc:
+        raise _plugin_archive_error() from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _write_managed_marketplace(marketplace_root: Path) -> None:
+    manifest = marketplace_root / ".agents" / "plugins" / "marketplace.json"
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "name": MARKETPLACE_NAME,
+        "interface": {"displayName": "Nebula3 MCP Local"},
+        "plugins": [
+            {
+                "name": PLUGIN_NAME,
+                "source": {"source": "local", "path": f"./plugins/{PLUGIN_NAME}"},
+                "policy": {
+                    "installation": "AVAILABLE",
+                    "authentication": "ON_INSTALL",
+                },
+                "category": "Developer Tools",
+            }
+        ],
+    }
+    manifest.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+
+def _secure_plugin_tree(root: Path) -> None:
+    if os.name == "nt":
+        return
+    for path in [root, *root.rglob("*")]:
+        if path.is_symlink():
+            raise _plugin_archive_error()
+        os.chmod(path, 0o700 if path.is_dir() else 0o600)
+
+
+def _validate_state(paths: ManagedPaths, state: InstallState) -> None:
+    if (
+        isinstance(state.schema_version, bool)
+        or not isinstance(state.schema_version, int)
+        or not isinstance(state.version, str)
+        or not state.version
+        or not isinstance(state.python, str)
+        or not state.python
+    ):
+        raise _error(
+            "state",
+            "installation state is invalid",
+            "Run the installer again to repair the installation.",
+        )
+    python_path = Path(state.python).expanduser()
+    python = python_path.parent.resolve() / python_path.name
+    if not python.is_relative_to(paths.root.expanduser().resolve()):
+        raise _error(
+            "state",
+            "installation state is invalid",
+            "Run the installer again to repair the installation.",
+        )
+
+
+def _confined_destination(paths: ManagedPaths, destination: Path, *, stage: str) -> Path:
+    _reject_root_leaf_symlink(paths, stage=stage)
+    root = paths.root.expanduser().resolve()
+    candidate = destination.expanduser().parent.resolve() / destination.name
+    if not destination.name or not candidate.is_relative_to(root):
+        raise _error(
+            stage,
+            "installation path is outside the managed root",
+            "Run the installer again to repair the installation.",
+        )
+    return candidate
+
+
+def _remove_managed_tree(
+    paths: ManagedPaths,
+    target: Path,
+    *,
+    stage: str,
+    ignore_errors: bool = False,
+) -> None:
+    _reject_root_leaf_symlink(paths, stage=stage)
+    confined = _confined_destination(paths, target, stage=stage)
+    if confined == paths.root:
+        raise _error(
+            stage,
+            "refusing to recursively remove the managed root through a child cleanup path",
+            "Inspect the managed installation root before retrying.",
+        )
+    try:
+        metadata = confined.lstat()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        if ignore_errors:
+            return
+        raise _error(
+            stage,
+            "could not inspect managed installation files",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+    if stat.S_ISLNK(metadata.st_mode):
+        if ignore_errors:
+            return
+        raise _error(
+            stage,
+            "refusing to recursively remove a symbolic link",
+            "Inspect the managed installation root before retrying.",
+        )
+    try:
+        shutil.rmtree(confined)
+    except OSError as exc:
+        if ignore_errors:
+            return
+        raise _error(
+            stage,
+            "could not remove managed installation files",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+
+
+def atomic_write_state(paths: ManagedPaths, state: InstallState) -> None:
+    destination = _confined_destination(paths, paths.state, stage="state")
+    _validate_state(paths, state)
+    paths.root.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=paths.root, delete=False, prefix=".state-"
+        ) as output:
+            temporary = Path(output.name)
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+            json.dump(
+                {
+                    "schema_version": state.schema_version,
+                    "version": state.version,
+                    "python": state.python,
+                },
+                output,
+                separators=(",", ":"),
+            )
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    except OSError as exc:
+        raise _error(
+            "state",
+            "could not update installation state",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def read_state(
+    paths: ManagedPaths, *, required: bool = True, secure: bool = True
+) -> InstallState | None:
+    try:
+        metadata = paths.state.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or _is_name_surrogate(paths.state, metadata):
+            raise OSError("not a regular file")
+    except FileNotFoundError as exc:
+        if not required:
+            return None
+        raise _error(
+            "state",
+            "installation state is missing",
+            "Run the installer again to repair the installation.",
+        ) from exc
+    except OSError as exc:
+        raise _error(
+            "state",
+            "installation state is invalid",
+            "Run the installer again to repair the installation.",
+        ) from exc
+    try:
+        if secure:
+            _secure_posix_file(paths.state, stage="state")
+        payload = json.loads(paths.state.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise _error(
+            "state",
+            "installation state is invalid",
+            "Run the installer again to repair the installation.",
+        ) from exc
+    if not isinstance(payload, dict) or set(payload) != {"schema_version", "version", "python"}:
+        raise _error(
+            "state",
+            "installation state is invalid",
+            "Run the installer again to repair the installation.",
+        )
+    state = InstallState(
+        schema_version=payload["schema_version"],
+        version=payload["version"],
+        python=payload["python"],
+    )
+    _validate_state(paths, state)
+    return state
+
+
+def render_launcher(paths: ManagedPaths) -> None:
+    destination = _confined_destination(paths, paths.launcher, stage="launcher")
+    paths.root.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=paths.root, delete=False, prefix=".launcher-"
+        ) as output:
+            temporary = Path(output.name)
+            if os.name != "nt":
+                os.chmod(temporary, 0o600)
+            output.write(LAUNCHER_CONTENT)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, destination)
+        temporary = None
+    except OSError as exc:
+        raise _error(
+            "launcher",
+            "could not update the stable launcher",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def release_asset_url(repository: str, version: str, tag: str | None = None) -> str:
+    return f"https://github.com/{repository}/releases/download/{tag or f'v{version}'}"
+
+
+def new_log_path(paths: ManagedPaths) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    destination = paths.logs / f"install-{timestamp}.log"
+    destination = _confined_destination(paths, destination, stage="log")
+    try:
+        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _secure_posix_directory(destination.parent, stage="log")
+        descriptor = os.open(
+            destination,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        os.close(descriptor)
+        _secure_posix_file(destination, stage="log")
+    except OSError as exc:
+        raise _error(
+            "log",
+            "could not create the installation log directory",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+    return destination
+
+
+def python_in_venv(venv: Path, *, platform_name: str | None = None) -> Path:
+    platform = os.name if platform_name is None else platform_name
+    if platform == "nt":
+        return venv / "Scripts/python.exe"
+    return venv / "bin/python"
+
+
+def validate_installed_python(paths: ManagedPaths, state: InstallState) -> None:
+    _validate_state(paths, state)
+    expected = python_in_venv(paths.versions / state.version / "venv")
+    declared = Path(state.python).expanduser()
+    root = paths.root.expanduser().resolve()
+    version = paths.versions / state.version
+    resolved_version = version.resolve()
+    parents = (paths.versions, version, version / "venv", expected.parent)
+    if (
+        _RELEASE_VERSION.fullmatch(state.version) is None
+        or declared != expected
+        or any(parent.is_symlink() for parent in parents)
+        or any(not parent.resolve().is_relative_to(root) for parent in parents)
+        or any(
+            not parent.resolve().is_relative_to(resolved_version)
+            for parent in parents[1:]
+        )
+        or not declared.is_file()
+    ):
+        raise _error(
+            "state",
+            "installed Python is missing or outside the selected version",
+            "Inspect the managed installation root and run the installer again.",
+        )
+
+
+def write_launcher_once(paths: ManagedPaths) -> None:
+    launcher = _confined_destination(paths, paths.launcher, stage="launcher")
+    if launcher.is_file() and not launcher.is_symlink():
+        try:
+            content = launcher.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise _error(
+                "launcher",
+                "the existing launcher is not managed by this installer",
+                "Move the foreign file aside and retry.",
+            ) from exc
+        if content != LAUNCHER_CONTENT:
+            raise _error(
+                "launcher",
+                "the existing launcher is not managed by this installer",
+                "Move the foreign file aside and retry.",
+            )
+        _secure_posix_file(launcher, stage="launcher")
+        return
+    if launcher.exists() and not launcher.is_symlink():
+        raise _error(
+            "launcher",
+            "the stable launcher path is not a regular file",
+            "Inspect the managed installation root and run the installer again.",
+        )
+    render_launcher(paths)
+
+
+def run_checked(stage: str, command: Sequence[str], *, log_path: Path) -> str:
+    environment = {
+        name: value for name, value in os.environ.items() if not name.upper().startswith("NEBULA_")
+    }
+    try:
+        completed = subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=environment,
+        )
+        with log_path.open("a", encoding="utf-8") as log:
+            log.write(f"[{stage} stdout]\n{completed.stdout}")
+            if completed.stdout and not completed.stdout.endswith("\n"):
+                log.write("\n")
+            log.write(f"[{stage} stderr]\n{completed.stderr}")
+            if completed.stderr and not completed.stderr.endswith("\n"):
+                log.write("\n")
+    except (OSError, ValueError) as exc:
+        raise _error(
+            stage,
+            f"the {stage} command could not be completed",
+            "Inspect the installation log in the managed data directory and retry.",
+        ) from exc
+    if completed.returncode != 0:
+        raise _error(
+            stage,
+            f"the {stage} command failed",
+            "Inspect the installation log in the managed data directory and retry.",
+        )
+    return completed.stdout
+
+
+def _validate_release_version(version: str) -> None:
+    if _RELEASE_VERSION.fullmatch(version) is None:
+        raise _error(
+            "install",
+            "the release version is invalid",
+            "Run the official installation command again.",
+        )
+
+
+def _release_asset(
+    base_url: str, name: str, destination: Path, *,
+    allow_http: bool, local_assets: Path | None,
+) -> None:
+    if local_assets is None:
+        download_file(f"{base_url}/{name}", destination, allow_http=allow_http)
+        return
+    source = local_assets / name
+    if source.is_symlink() or not source.is_file():
+        raise _error("install", "local release asset is missing or unsafe",
+                     "Use an extracted release folder containing wheel, plugin and SHA256SUMS.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(source, destination)
+
+
+def install_release(
+    paths: ManagedPaths,
+    *,
+    version: str,
+    asset_base_url: str,
+    system_python: Path,
+    local_assets: Path | None = None,
+) -> InstallState:
+    _validate_release_version(version)
+    initialize_managed_root(paths)
+    current = read_state(paths, required=False)
+    if current is not None and current.version == version:
+        validate_installed_python(paths, current)
+        write_launcher_once(paths)
+        return current
+
+    target = _confined_destination(paths, paths.versions / version, stage="install")
+    if target.exists() or target.is_symlink():
+        raise _error(
+            "install",
+            "the release version directory already exists but is not active",
+            "Inspect the managed root before retrying the installation.",
+        )
+
+    staging = _confined_destination(
+        paths,
+        paths.staging / uuid.uuid4().hex,
+        stage="install",
+    )
+    staged_version = staging / version
+    wheel_name = f"nebula3_mcp-{version}-py3-none-any.whl"
+    base_url = asset_base_url.rstrip("/")
+    parsed_base_url = urllib.parse.urlparse(base_url)
+    allow_http = parsed_base_url.scheme == "http" and _is_loopback_http(parsed_base_url)
+    target_activated = False
+    launcher_existed = paths.launcher.exists() or paths.launcher.is_symlink()
+    committed = False
+    try:
+        wheel = staging / wheel_name
+        manifest = staging / "SHA256SUMS"
+        _release_asset(base_url, wheel_name, wheel, allow_http=allow_http, local_assets=local_assets)
+        _release_asset(base_url, "SHA256SUMS", manifest, allow_http=allow_http, local_assets=local_assets)
+        try:
+            expected = parse_checksums(manifest.read_text(encoding="utf-8"))[wheel_name]
+        except KeyError as exc:
+            raise _error(
+                "checksum",
+                "checksum manifest does not include the release wheel",
+                "Download the matching release manifest again.",
+            ) from exc
+        except (OSError, UnicodeError) as exc:
+            raise _error(
+                "checksum",
+                "could not read the checksum manifest",
+                "Download the release manifest again.",
+            ) from exc
+        verify_sha256(wheel, expected)
+
+        log_path = new_log_path(paths)
+        run_checked(
+            "venv",
+            [str(system_python), "-m", "venv", str(staged_version / "venv")],
+            log_path=log_path,
+        )
+        venv_python = python_in_venv(staged_version / "venv")
+        run_checked(
+            "install",
+            [str(venv_python), "-m", "pip", "install", str(wheel)],
+            log_path=log_path,
+        )
+        run_checked(
+            "pip-check",
+            [str(venv_python), "-m", "pip", "check"],
+            log_path=log_path,
+        )
+        run_checked(
+            "import",
+            [str(venv_python), "-c", "import nebula3_mcp"],
+            log_path=log_path,
+        )
+        reported_version = run_checked(
+            "version",
+            [str(venv_python), "-m", "nebula3_mcp", "--version"],
+            log_path=log_path,
+        ).strip()
+        if reported_version != f"nebula3-mcp {version}":
+            raise _error(
+                "version",
+                "the installed package reported an unexpected version",
+                "Download the matching release assets and retry.",
+            )
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(staged_version, target)
+            target_activated = True
+        except OSError as exc:
+            raise _error(
+                "install",
+                "could not activate the validated release directory",
+                "Inspect the managed installation root and retry.",
+            ) from exc
+        installed = InstallState(
+            schema_version=1,
+            version=version,
+            python=str(python_in_venv(target / "venv")),
+        )
+        validate_installed_python(paths, installed)
+        write_launcher_once(paths)
+        atomic_write_state(paths, installed)
+        committed = True
+        return installed
+    finally:
+        if not committed:
+            if target_activated:
+                _remove_managed_tree(paths, target, stage="install", ignore_errors=True)
+            if not launcher_existed:
+                paths.launcher.unlink(missing_ok=True)
+        _remove_managed_tree(paths, staging, stage="install", ignore_errors=True)
+
+
+def install_plugin_release(
+    paths: ManagedPaths,
+    *,
+    version: str,
+    asset_base_url: str,
+    system_python: Path,
+    local_assets: Path | None = None,
+) -> InstallState:
+    """Verify the plugin before changing runtime state, then activate both with rollback."""
+
+    _validate_release_version(version)
+    initialize_managed_root(paths)
+    previous_state = read_state(paths, required=False)
+    launcher_existed = paths.launcher.exists() or paths.launcher.is_symlink()
+    staging = _confined_destination(
+        paths,
+        paths.staging / uuid.uuid4().hex,
+        stage="plugin",
+    )
+    base_url = asset_base_url.rstrip("/")
+    parsed_base_url = urllib.parse.urlparse(base_url)
+    allow_http = parsed_base_url.scheme == "http" and _is_loopback_http(parsed_base_url)
+    archive_name = f"nebula3-mcp-plugin-{version}.zip"
+    previous_marketplace = staging / "previous-marketplace"
+    marketplace_activated = False
+    runtime: InstallState | None = None
+    try:
+        archive = staging / archive_name
+        manifest = staging / "SHA256SUMS"
+        _release_asset(base_url, archive_name, archive, allow_http=allow_http, local_assets=local_assets)
+        _release_asset(base_url, "SHA256SUMS", manifest, allow_http=allow_http, local_assets=local_assets)
+        try:
+            checksums = parse_checksums(manifest.read_text(encoding="utf-8"))
+            expected = checksums[archive_name]
+        except KeyError as exc:
+            raise _error(
+                "checksum",
+                "checksum manifest does not include the plugin archive",
+                "Download the matching release manifest again.",
+            ) from exc
+        except (OSError, UnicodeError) as exc:
+            raise _error(
+                "checksum",
+                "could not read the checksum manifest",
+                "Download the release manifest again.",
+            ) from exc
+        verify_sha256(archive, expected)
+        staged_marketplace = staging / "marketplace"
+        staged_plugin = extract_plugin_archive(archive, staged_marketplace)
+        manifest_payload = _read_plugin_json(
+            staged_plugin / ".codex-plugin" / "plugin.json"
+        )
+        if (
+            manifest_payload.get("name") != PLUGIN_NAME
+            or manifest_payload.get("version") != version
+            or manifest_payload.get("mcpServers") != "./.mcp.json"
+        ):
+            raise _plugin_archive_error()
+        render_managed_mcp_config(staged_plugin, system_python, paths.launcher)
+        _write_managed_marketplace(staged_marketplace)
+        _secure_plugin_tree(staged_marketplace)
+
+        runtime = install_release(
+            paths,
+            version=version,
+            asset_base_url=asset_base_url,
+            system_python=system_python,
+            local_assets=local_assets,
+        )
+        if paths.marketplace_root.exists():
+            os.replace(paths.marketplace_root, previous_marketplace)
+        os.replace(staged_marketplace, paths.marketplace_root)
+        marketplace_activated = True
+        _secure_plugin_tree(paths.marketplace_root)
+        return runtime
+    except (InstallerError, OSError) as exc:
+        if marketplace_activated:
+            _remove_managed_tree(
+                paths,
+                paths.marketplace_root,
+                stage="plugin",
+                ignore_errors=True,
+            )
+        if previous_marketplace.exists() and not paths.marketplace_root.exists():
+            try:
+                os.replace(previous_marketplace, paths.marketplace_root)
+            except OSError:
+                pass
+        if runtime is not None and (
+            previous_state is None or runtime.version != previous_state.version
+        ):
+            _remove_managed_tree(
+                paths,
+                paths.versions / runtime.version,
+                stage="plugin",
+                ignore_errors=True,
+            )
+            if previous_state is None:
+                paths.state.unlink(missing_ok=True)
+                if not launcher_existed:
+                    paths.launcher.unlink(missing_ok=True)
+            else:
+                atomic_write_state(paths, previous_state)
+        if isinstance(exc, InstallerError):
+            raise
+        raise _error(
+            "plugin",
+            "could not activate the managed Codex plugin",
+            "The previous runtime and plugin were retained; inspect the managed root and retry.",
+        ) from exc
+    finally:
+        _remove_managed_tree(paths, staging, stage="plugin", ignore_errors=True)
+
+
+def _sanitized_environment() -> dict[str, str]:
+    return {
+        name: value for name, value in os.environ.items() if not name.upper().startswith("NEBULA_")
+    }
+
+
+def render_manual_registration_command(
+    system_python: Path,
+    launcher: Path,
+    *,
+    platform_name: str | None = None,
+) -> str:
+    arguments = ["codex", "mcp", "add", SERVER_NAME]
+    for key, value in NEW_REGISTRATION_ENVIRONMENT.items():
+        arguments.extend(["--env", f"{key}={value}"])
+    arguments.extend(["--", str(system_python), str(launcher)])
+    platform = sys.platform if platform_name is None else platform_name
+    if platform == "win32":
+        return "& " + " ".join(
+            "'" + argument.replace("'", "''") + "'" for argument in arguments
+        )
+    return shlex.join(arguments)
+
+
+def run_codex(
+    command: CodexCommand, arguments: Sequence[str]
+) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            [*command, *arguments],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=_sanitized_environment(),
+        )
+    except (OSError, ValueError) as exc:
+        raise _error(
+            "codex-registration",
+            "the Codex MCP command could not be completed",
+            "Check that the Codex CLI is installed and try again.",
+        ) from exc
+
+
+def codex_config_path(
+    *, env: Mapping[str, str] | None = None, home: Path | None = None
+) -> Path:
+    source = os.environ if env is None else env
+    base = source.get("CODEX_HOME")
+    if base:
+        return Path(base).expanduser() / "config.toml"
+    return (Path.home() if home is None else home) / ".codex/config.toml"
+
+
+def _snapshot_codex_config(path: Path) -> tuple[bytes | None, int | None]:
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise _error(
+            "codex-configuration",
+            "the Codex configuration path is not a regular file",
+            "Replace it with a regular config.toml file and retry.",
+        )
+    if not path.exists():
+        return None, None
+    try:
+        return path.read_bytes(), stat.S_IMODE(path.stat().st_mode)
+    except OSError as exc:
+        raise _error(
+            "codex-configuration",
+            "the Codex configuration could not be read safely",
+            "Check the Codex configuration permissions and retry.",
+        ) from exc
+
+
+def _atomic_write_codex_config(path: Path, content: bytes, mode: int | None) -> None:
+    temporary: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent, delete=False, prefix=".config-"
+        ) as output:
+            temporary = Path(output.name)
+            if os.name != "nt":
+                os.chmod(temporary, 0o600 if mode is None else mode)
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _restore_codex_config(
+    path: Path, original: bytes | None, original_mode: int | None
+) -> None:
+    try:
+        if original is None:
+            path.unlink(missing_ok=True)
+        else:
+            _atomic_write_codex_config(path, original, original_mode)
+    except OSError as exc:
+        raise _error(
+            "codex-configuration",
+            "the previous Codex configuration could not be restored",
+            "Stop Codex and restore config.toml from backup before retrying.",
+        ) from exc
+
+
+def _toml_basic_string_content(value: str) -> str:
+    escaped: list[str] = []
+    named = {
+        "\b": "\\b",
+        "\t": "\\t",
+        "\n": "\\n",
+        "\f": "\\f",
+        "\r": "\\r",
+        '"': '\\"',
+        "\\": "\\\\",
+    }
+    for character in value:
+        replacement = named.get(character)
+        if replacement is not None:
+            escaped.append(replacement)
+        elif ord(character) < 0x20 or ord(character) == 0x7F:
+            escaped.append(f"\\u{ord(character):04X}")
+        else:
+            escaped.append(character)
+    return "".join(escaped)
+
+
+def replace_codex_secret_placeholder(
+    path: Path, placeholder: str, password: str
+) -> None:
+    try:
+        content = path.read_bytes()
+        marker = placeholder.encode("ascii")
+        if content.count(marker) != 1:
+            raise ValueError("secret placeholder is not unique")
+        replacement = _toml_basic_string_content(password).encode("utf-8")
+        mode = stat.S_IMODE(path.stat().st_mode)
+        _atomic_write_codex_config(path, content.replace(marker, replacement), mode)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise _error(
+            "codex-configuration",
+            "the Codex configuration could not be updated safely",
+            "The previous configuration will be restored; retry after closing Codex.",
+        ) from exc
+
+
+def _managed_launch(paths: ManagedPaths) -> tuple[str, list[str]]:
+    state = read_state(paths)
+    assert state is not None
+    validate_installed_python(paths, state)
+    write_launcher_once(paths)
+    plugin_config = paths.plugin_root / ".mcp.json"
+    if plugin_config.is_file() and not plugin_config.is_symlink():
+        mapping = _read_plugin_json(plugin_config)
+        servers = mapping.get("mcpServers")
+        server = servers.get(SERVER_NAME) if isinstance(servers, dict) else None
+        if isinstance(server, dict):
+            command = server.get("command")
+            arguments = server.get("args")
+            if (
+                isinstance(command, str)
+                and Path(command).is_absolute()
+                and Path(command).is_file()
+                and arguments == [str(paths.launcher)]
+            ):
+                return command, [str(paths.launcher)]
+    python = Path(sys.executable).resolve()
+    if not python.is_file():
+        raise _error(
+            "codex-configuration",
+            "the Python command for the managed launcher is unavailable",
+            "Run the installer again before configuring the connection.",
+        )
+    return str(python), [str(paths.launcher)]
+
+
+def _read_nebula_registration(command: CodexCommand) -> dict[str, object] | None:
+    completed = run_codex(command, ["mcp", "get", SERVER_NAME, "--json"])
+    if completed.returncode != 0:
+        if f"No MCP server named '{SERVER_NAME}' found." in completed.stderr:
+            return None
+        raise _error(
+            "codex-configuration",
+            "the nebula3 MCP configuration could not be inspected",
+            "Update Codex or resolve its MCP configuration error and retry.",
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise _error(
+            "codex-configuration",
+            "Codex returned an invalid nebula3 MCP configuration",
+            "Update Codex and retry.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _error(
+            "codex-configuration",
+            "Codex returned an invalid nebula3 MCP configuration",
+            "Update Codex and retry.",
+        )
+    return payload
+
+
+def _registration_environment(payload: Mapping[str, object] | None) -> dict[str, str]:
+    if payload is None:
+        return {}
+    transport = payload.get("transport")
+    environment = transport.get("env") if isinstance(transport, dict) else None
+    if not isinstance(environment, dict):
+        return {}
+    return {
+        key: value
+        for key, value in environment.items()
+        if isinstance(key, str) and isinstance(value, str)
+    }
+
+
+def configure_codex(
+    *,
+    paths: ManagedPaths,
+    codex_command: CodexCommand | None,
+    addresses: str,
+    username: str,
+    password: str,
+) -> str:
+    if codex_command is None:
+        raise _error(
+            "codex-configuration",
+            "the Codex CLI is required to save the MCP configuration",
+            "Install or update Codex, then rerun this command.",
+        )
+    if not addresses.strip() or not username.strip() or not password:
+        raise _error(
+            "codex-configuration",
+            "address, username, and password are required",
+            "Rerun the command and provide all three values.",
+        )
+    config = codex_config_path()
+    original, original_mode = _snapshot_codex_config(config)
+    placeholder = f"nebula3-mcp-secret-{uuid.uuid4().hex}"
+    command, arguments = _managed_launch(paths)
+    values = {
+        "NEBULA_ADDRESSES": addresses.strip(),
+        "NEBULA_USERNAME": username.strip(),
+        "NEBULA_PASSWORD": placeholder,
+        "NEBULA_CONNECT_TIMEOUT_MS": "30000",
+        "NEBULA_ALLOW_MUTATIONS": "false",
+    }
+    add_arguments = ["mcp", "add", SERVER_NAME]
+    for key, value in values.items():
+        add_arguments.extend(["--env", f"{key}={value}"])
+    add_arguments.extend(["--", command, *arguments])
+    try:
+        _require_codex_success(
+            codex_command,
+            add_arguments,
+            operation="update",
+        )
+        replace_codex_secret_placeholder(config, placeholder, password)
+        payload = _read_nebula_registration(codex_command)
+        transport = payload.get("transport") if payload is not None else None
+        environment = _registration_environment(payload)
+        if (
+            not isinstance(transport, dict)
+            or transport.get("command") != command
+            or transport.get("args") != arguments
+            or environment.get("NEBULA_ADDRESSES") != addresses.strip()
+            or environment.get("NEBULA_USERNAME") != username.strip()
+            or not hmac.compare_digest(environment.get("NEBULA_PASSWORD", ""), password)
+            or environment.get("NEBULA_CONNECT_TIMEOUT_MS") != "30000"
+            or environment.get("NEBULA_ALLOW_MUTATIONS") != "false"
+        ):
+            raise _error(
+                "codex-configuration",
+                "Codex did not preserve the complete nebula3 MCP configuration",
+                "The previous configuration will be restored; update Codex and retry.",
+            )
+    except Exception as exc:
+        _restore_codex_config(config, original, original_mode)
+        if isinstance(exc, InstallerError):
+            raise
+        raise _error(
+            "codex-configuration",
+            "the Codex configuration could not be updated safely",
+            "The previous configuration was restored; close Codex and retry.",
+        ) from exc
+    return "nebula3 MCP configuration updated; restart Codex to apply it"
+
+
+def print_configuration_status(command: CodexCommand | None) -> None:
+    if command is None:
+        raise _error(
+            "codex-configuration",
+            "the Codex CLI is required to inspect the MCP configuration",
+            "Install or update Codex, then rerun this command.",
+        )
+    environment = _registration_environment(_read_nebula_registration(command))
+    print("nebula3 MCP configuration:")
+    for key in CONNECTION_ENVIRONMENT:
+        print(f"{key}: {'set' if environment.get(key) else 'not set'}")
+
+
+def clear_codex_configuration(
+    *, paths: ManagedPaths, codex_command: CodexCommand | None
+) -> str:
+    if codex_command is None:
+        raise _error(
+            "codex-configuration",
+            "the Codex CLI is required to clear the MCP configuration",
+            "Install or update Codex, then rerun this command.",
+        )
+    command, arguments = _managed_launch(paths)
+    payload = _read_nebula_registration(codex_command)
+    if payload is not None:
+        transport = payload.get("transport")
+        if (
+            not isinstance(transport, dict)
+            or transport.get("command") != command
+            or transport.get("args") != arguments
+        ):
+            raise _error(
+                "codex-configuration",
+                "the nebula3 MCP registration is not managed by this installation",
+                "Inspect the existing registration before clearing it.",
+            )
+    config = codex_config_path()
+    original, original_mode = _snapshot_codex_config(config)
+    try:
+        _require_codex_success(
+            codex_command,
+            ["mcp", "remove", SERVER_NAME],
+            operation="clear",
+        )
+        if any(
+            _registration_environment(_read_nebula_registration(codex_command)).get(key)
+            for key in CONNECTION_ENVIRONMENT
+        ):
+            raise _error(
+                "codex-configuration",
+                "the nebula3 MCP connection configuration was not cleared",
+                "The previous configuration will be restored; update Codex and retry.",
+            )
+    except Exception as exc:
+        _restore_codex_config(config, original, original_mode)
+        if isinstance(exc, InstallerError):
+            raise
+        raise _error(
+            "codex-configuration",
+            "the nebula3 MCP connection configuration could not be cleared",
+            "The previous configuration was restored; close Codex and retry.",
+        ) from exc
+    return "nebula3 MCP connection configuration cleared"
+
+
+def find_codex() -> CodexCommand | None:
+    executable = shutil.which("codex")
+    if executable is None:
+        return None
+    return (executable,)
+
+
+def classify_registration(
+    payload: Mapping[str, object],
+    launcher: Path,
+    system_python: Path,
+) -> RegistrationKind:
+    transport = payload.get("transport")
+    if not isinstance(transport, dict) or transport.get("type") != "stdio":
+        return "conflict"
+    command = transport.get("command")
+    args = transport.get("args")
+    if (
+        isinstance(command, str)
+        and system_python.is_absolute()
+        and system_python.is_file()
+        and command == str(system_python)
+        and Path(command).is_absolute()
+        and launcher.is_absolute()
+        and args == [str(launcher)]
+    ):
+        return "managed"
+    return "conflict"
+
+
+def _has_standalone_nebula_registration() -> bool:
+    content, _ = _snapshot_codex_config(codex_config_path())
+    if content is None:
+        return False
+    return re.search(
+        rb"(?m)^[ \t]*\[[ \t]*mcp_servers[ \t]*\.[ \t]*(?:nebula|\"nebula\"|'nebula3')[ \t]*\]",
+        content,
+    ) is not None
+
+
+def inspect_registration(
+    command: CodexCommand,
+    launcher: Path,
+    system_python: Path,
+    plugin_root: Path | None = None,
+) -> RegistrationKind:
+    completed = run_codex(command, ["mcp", "get", SERVER_NAME, "--json"])
+    if completed.returncode != 0:
+        if f"No MCP server named '{SERVER_NAME}' found." in completed.stderr:
+            return "absent"
+        raise _error(
+            "codex-registration",
+            "could not inspect the existing Codex MCP registration",
+            f"Run codex mcp get {SERVER_NAME} and resolve the error before retrying.",
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise _error(
+            "codex-registration",
+            "Codex returned an invalid MCP registration",
+            f"Run codex mcp get {SERVER_NAME} and inspect the registration.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _error(
+            "codex-registration",
+            "Codex returned an invalid MCP registration",
+            f"Run codex mcp get {SERVER_NAME} and inspect the registration.",
+        )
+    if plugin_root is not None and not _has_standalone_nebula_registration():
+        plugin_config = plugin_root / ".mcp.json"
+        if plugin_config.is_file() and not plugin_config.is_symlink():
+            plugin = _read_plugin_json(plugin_config)
+            servers = plugin.get("mcpServers")
+            server = servers.get(SERVER_NAME) if isinstance(servers, dict) else None
+            transport = payload.get("transport")
+            if (
+                isinstance(server, dict)
+                and isinstance(transport, dict)
+                and transport.get("command") == server.get("command")
+                and transport.get("args") == server.get("args")
+            ):
+                return "absent"
+    return classify_registration(payload, launcher, system_python)
+
+
+def confirm_environment_loss(*, assume_yes: bool) -> None:
+    print(
+        "Warning: replacing the existing nebula3 MCP registration will delete "
+        "its environment variables."
+    )
+    if assume_yes:
+        return
+    try:
+        response = input("Replace the existing registration? [y/N] ")
+    except EOFError as exc:
+        raise _error(
+            "codex-registration",
+            "registration replacement was not confirmed",
+            "Retry interactively or pass --yes with --replace-registration.",
+        ) from exc
+    if response.strip().lower() not in {"y", "yes"}:
+        raise _error(
+            "codex-registration",
+            "registration replacement was cancelled",
+            "The existing Codex MCP registration was left unchanged.",
+        )
+
+
+def _require_codex_success(
+    command: CodexCommand, arguments: Sequence[str], *, operation: str
+) -> None:
+    completed = run_codex(command, arguments)
+    if completed.returncode != 0:
+        raise _error(
+            "codex-registration",
+            f"could not {operation} the Codex MCP registration",
+            f"Run codex mcp get {SERVER_NAME} and resolve the error before retrying.",
+        )
+
+
+def _require_codex_json_success(
+    command: CodexCommand,
+    arguments: Sequence[str],
+    *,
+    operation: str,
+) -> None:
+    completed = run_codex(command, arguments)
+    if completed.returncode != 0:
+        raise _error(
+            "codex-plugin",
+            f"could not {operation} the Codex plugin",
+            "The managed files were retained; resolve the Codex error and retry.",
+        )
+    try:
+        payload = json.loads(completed.stdout)
+    except json.JSONDecodeError as exc:
+        raise _error(
+            "codex-plugin",
+            "Codex returned invalid plugin command output",
+            "The managed files were retained; update Codex and retry.",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _error(
+            "codex-plugin",
+            "Codex returned invalid plugin command output",
+            "The managed files were retained; update Codex and retry.",
+        )
+
+
+def render_manual_plugin_commands(paths: ManagedPaths) -> str:
+    commands = [
+        ["codex", "plugin", "marketplace", "add", str(paths.marketplace_root), "--json"],
+        ["codex", "plugin", "add", PLUGIN_REFERENCE, "--json"],
+    ]
+    if sys.platform == "win32":
+        return "\n".join(
+            "& " + " ".join("'" + value.replace("'", "''") + "'" for value in command)
+            for command in commands
+        )
+    return "\n".join(shlex.join(command) for command in commands)
+
+
+def ensure_plugin_registration(
+    *,
+    paths: ManagedPaths,
+    system_python: Path,
+    codex_command: CodexCommand | None,
+    migrate: bool,
+) -> str:
+    if codex_command is None:
+        return render_manual_plugin_commands(paths)
+    registration = inspect_registration(
+        codex_command, paths.launcher, system_python, paths.plugin_root
+    )
+    if registration == "conflict":
+        raise _error(
+            "codex-plugin",
+            f"An MCP server named {SERVER_NAME} already uses another command",
+            f"Run codex mcp get {SERVER_NAME}; the installer will not remove this conflict.",
+        )
+    if registration == "managed" and not migrate:
+        return (
+            "standalone MCP registration preserved; rerun the installer with "
+            "--migrate-to-plugin to switch explicitly"
+        )
+    if registration == "managed":
+        _require_codex_success(
+            codex_command,
+            ["mcp", "remove", SERVER_NAME],
+            operation="remove",
+        )
+    _require_codex_json_success(
+        codex_command,
+        ["plugin", "marketplace", "add", str(paths.marketplace_root), "--json"],
+        operation="add the local marketplace for",
+    )
+    _require_codex_json_success(
+        codex_command,
+        ["plugin", "add", PLUGIN_REFERENCE, "--json"],
+        operation="install",
+    )
+    return "plugin registration created"
+
+
+def ensure_registration(
+    *,
+    paths: ManagedPaths,
+    system_python: Path,
+    codex_command: CodexCommand | None,
+    replace: bool,
+    assume_yes: bool,
+) -> str:
+    manual_command = render_manual_registration_command(system_python, paths.launcher)
+    if codex_command is None:
+        return manual_command
+    registration = inspect_registration(
+        codex_command, paths.launcher, system_python, paths.plugin_root
+    )
+    if registration == "managed":
+        return "registration preserved"
+    if registration == "conflict" and not replace:
+        raise _error(
+            "codex-registration",
+            f"An MCP server named {SERVER_NAME} already uses another command",
+            f"Run codex mcp get {SERVER_NAME} or retry with --replace-registration",
+        )
+    if registration == "conflict":
+        confirm_environment_loss(assume_yes=assume_yes)
+        _require_codex_success(
+            codex_command,
+            ["mcp", "remove", SERVER_NAME],
+            operation="remove",
+        )
+    add_arguments = ["mcp", "add", SERVER_NAME]
+    for key, value in NEW_REGISTRATION_ENVIRONMENT.items():
+        add_arguments.extend(["--env", f"{key}={value}"])
+    add_arguments.extend(["--", str(system_python), str(paths.launcher)])
+    _require_codex_success(codex_command, add_arguments, operation="create")
+    return "registration created"
+
+
+def default_paths() -> ManagedPaths:
+    return managed_paths(resolve_data_root())
+
+
+def _confirm_install(paths: ManagedPaths, *, assume_yes: bool) -> None:
+    if assume_yes:
+        return
+    print(f"Target version: {TARGET_VERSION}")
+    print(f"Data root: {paths.root}")
+    print(f"MCP server: {SERVER_NAME}")
+    try:
+        response = input("Continue with installation? [y/N] ")
+    except EOFError as exc:
+        raise _error(
+            "install",
+            "installation was not confirmed",
+            "Retry interactively or pass --yes.",
+        ) from exc
+    if response.strip().lower() not in {"y", "yes"}:
+        raise _error(
+            "install",
+            "installation was cancelled",
+            "Run the installer again when ready.",
+        )
+
+
+def install_and_register(args: argparse.Namespace) -> None:
+    paths = default_paths()
+    if read_state(paths, required=False, secure=False) is None:
+        _confirm_install(paths, assume_yes=args.yes)
+    system_python = Path(sys.executable).resolve()
+    mode: InstallMode = getattr(args, "mode", "mcp")
+    release_installer = install_plugin_release if mode == "plugin" else install_release
+    release_installer(
+        paths,
+        version=TARGET_VERSION,
+        asset_base_url=release_asset_url(TARGET_REPOSITORY, TARGET_VERSION, TARGET_TAG),
+        system_python=system_python,
+        local_assets=getattr(args, "assets", None),
+    )
+    codex_command = find_codex()
+    if mode == "plugin":
+        registration = ensure_plugin_registration(
+            paths=paths,
+            system_python=system_python,
+            codex_command=codex_command,
+            migrate=getattr(args, "migrate_to_plugin", False),
+        )
+    else:
+        registration = ensure_registration(
+            paths=paths,
+            system_python=system_python,
+            codex_command=codex_command,
+            replace=args.replace_registration,
+            assume_yes=args.yes,
+        )
+    print(f"Installed nebula3-mcp {TARGET_VERSION} in {paths.root}")
+    if codex_command is None:
+        print("Codex CLI was not found. Register the installed server later with:")
+    print(registration)
+
+
+def _validate_uninstall_root(paths: ManagedPaths) -> None:
+    _reject_root_leaf_symlink(paths, stage="uninstall")
+    expected = managed_paths(paths.root)
+    if paths != expected or not paths.root.is_dir() or paths.root.is_symlink():
+        raise _error(
+            "uninstall",
+            "the installation root is not a valid managed installation",
+            "Inspect the managed installation root before retrying.",
+        )
+    initialize_managed_root(paths, stage="uninstall")
+    if not paths.state.is_file() or paths.state.is_symlink():
+        raise _error(
+            "uninstall",
+            "the installation state is not part of a valid managed installation",
+            "Run the installer again to repair the installation before uninstalling.",
+        )
+    state = read_state(paths)
+    assert state is not None
+    validate_installed_python(paths, state)
+    if not paths.launcher.is_file() or paths.launcher.is_symlink():
+        raise _error(
+            "uninstall",
+            "the stable launcher is missing or invalid",
+            "Run the installer again to repair the installation before uninstalling.",
+        )
+    write_launcher_once(paths)
+
+
+def uninstall(paths: ManagedPaths, command: CodexCommand | None) -> None:
+    root_metadata = _reject_root_leaf_symlink(paths, stage="uninstall")
+    if root_metadata is None:
+        return
+    _validate_uninstall_root(paths)
+    if command is None:
+        raise _error(
+            "uninstall",
+            "the Codex CLI is required to verify MCP registration removal",
+            "Install the Codex CLI and run uninstall again.",
+        )
+    if paths.marketplace_root.is_dir() and not paths.marketplace_root.is_symlink():
+        removed = run_codex(
+            command,
+            ["plugin", "remove", PLUGIN_REFERENCE, "--json"],
+        )
+        if removed.returncode != 0:
+            raise _error(
+                "uninstall",
+                "could not remove the installed Codex plugin",
+                "The installation files were retained; resolve the Codex error and retry.",
+            )
+        marketplace_removed = run_codex(
+            command,
+            ["plugin", "marketplace", "remove", MARKETPLACE_NAME],
+        )
+        if marketplace_removed.returncode != 0:
+            raise _error(
+                "uninstall",
+                "could not remove the local Codex marketplace",
+                "The installation files were retained; resolve the Codex error and retry.",
+            )
+        try:
+            _reject_root_leaf_symlink(paths, stage="uninstall")
+            shutil.rmtree(paths.root)
+        except OSError as exc:
+            raise _error(
+                "uninstall",
+                "could not remove the managed installation files",
+                "Check the installation directory permissions and try again.",
+            ) from exc
+        return
+    registration = inspect_registration(
+        command,
+        paths.launcher,
+        Path(sys.executable).resolve(),
+    )
+    if registration == "conflict":
+        raise _error(
+            "uninstall",
+            f"the {SERVER_NAME} MCP registration is not managed by this installation",
+            f"Run codex mcp get {SERVER_NAME} and resolve the conflict before retrying.",
+        )
+    if registration == "managed":
+        completed = run_codex(command, ["mcp", "remove", SERVER_NAME])
+        if completed.returncode != 0:
+            raise _error(
+                "uninstall",
+                "could not remove the Codex MCP registration",
+                "The installation files were retained; resolve the Codex error and retry.",
+            )
+    try:
+        _reject_root_leaf_symlink(paths, stage="uninstall")
+        shutil.rmtree(paths.root)
+    except OSError as exc:
+        raise _error(
+            "uninstall",
+            "could not remove the managed installation files",
+            "Check the installation directory permissions and try again.",
+        ) from exc
+
+
+def report_error(error: InstallerError) -> int:
+    print(f"Stage: {error.stage}", file=sys.stderr)
+    print(f"Error: {error.message}", file=sys.stderr)
+    print(f"Next step: {error.next_step}", file=sys.stderr)
+    return 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Install nebula3-mcp for Codex")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--version", action="store_true")
+    actions.add_argument("--uninstall", action="store_true")
+    actions.add_argument("--configure", action="store_true")
+    actions.add_argument("--config-status", action="store_true")
+    actions.add_argument("--clear-config", action="store_true")
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--assets", type=Path, help="Install from a local release folder; verify SHA256SUMS")
+    parser.add_argument("--replace-registration", action="store_true")
+    parser.add_argument("--mode", choices=("plugin", "mcp"), default="plugin")
+    parser.add_argument("--migrate-to-plugin", action="store_true")
+    return parser
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if sys.version_info < MINIMUM_PYTHON:
+        return report_error(
+            InstallerError(
+                "python-version",
+                "Python 3.10 or newer is required",
+                "Install a supported Python and rerun this installer",
+            )
+        )
+    if args.version:
+        print(TARGET_VERSION)
+        return 0
+    try:
+        if args.configure:
+            addresses = input("NEBULA_ADDRESSES: ").strip()
+            username = input("NEBULA_USERNAME: ").strip()
+            password = getpass.getpass("NEBULA_PASSWORD: ")
+            print(
+                configure_codex(
+                    paths=default_paths(),
+                    codex_command=find_codex(),
+                    addresses=addresses,
+                    username=username,
+                    password=password,
+                )
+            )
+        elif args.config_status:
+            print_configuration_status(find_codex())
+        elif args.clear_config:
+            print(
+                clear_codex_configuration(
+                    paths=default_paths(),
+                    codex_command=find_codex(),
+                )
+            )
+        elif args.uninstall:
+            uninstall(default_paths(), find_codex())
+        else:
+            install_and_register(args)
+    except InstallerError as exc:
+        return report_error(exc)
+    except Exception:  # noqa: BLE001 - final CLI boundary must suppress tracebacks
+        return report_error(
+            InstallerError(
+                "unexpected",
+                "the installer could not complete safely",
+                "Check the managed data directory and retry.",
+            )
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

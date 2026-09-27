@@ -1,0 +1,135 @@
+name: Build and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    permissions:
+      contents: read
+    runs-on: macos-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      title: ${{ steps.version.outputs.title }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Set up Node
+        uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "24"
+          package-manager-cache: false
+      - name: Install UI dependencies
+        run: npm ci
+        working-directory: ui
+      - name: Run UI tests and typecheck
+        run: |
+          npm test
+          npm run typecheck
+        working-directory: ui
+      - name: Build UI and verify committed artifact
+        run: |
+          npm run build
+          git diff --exit-code -- ../src/nebula3_mcp/ui/query-result.html
+        working-directory: ui
+      - name: Install development dependencies
+        run: python -m pip install '.[dev]'
+      - name: Run test suite
+        run: |
+          python -m pytest -q
+          python -m ruff check --extension in:python .
+          python -m mypy src
+      - name: Stamp reproducible release version
+        id: version
+        run: python scripts/release_version.py --write
+      - name: Build distributions and prepare Release assets
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          python -m build
+          python scripts/prepare_release.py --repository "$GITHUB_REPOSITORY" --tag "$RELEASE_TAG" --dist dist
+          test "$(python dist/install.py --version)" = "$PACKAGE_VERSION"
+          (cd dist && shasum -a 256 -c SHA256SUMS)
+          python -m venv "$RUNNER_TEMP/nebula-wheel"
+          "$RUNNER_TEMP/nebula-wheel/bin/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/nebula-wheel/bin/python" -m pip check
+          test "$("$RUNNER_TEMP/nebula-wheel/bin/python" -m nebula3_mcp --version)" = "nebula3-mcp $PACKAGE_VERSION"
+          NEBULA_WHEEL_PYTHON="$RUNNER_TEMP/nebula-wheel/bin/python" python -m pytest tests/protocol/test_stdio.py -q
+          python scripts/publish_release.py --verify-only --dist dist --version "$PACKAGE_VERSION" --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA"
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  installer-compatibility:
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Install development dependencies
+        run: python -m pip install '.[dev]'
+      - name: Run installer unit and integration compatibility
+        run: python -m pytest tests/unit/test_installer.py tests/integration/test_installer_cli.py -q
+      - name: Run rendered installer smoke
+        run: python -m pytest tests/unit/test_release_assets.py tests/unit/test_calendar_release.py -q
+
+  publish:
+    needs: [validate, installer-compatibility]
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout publication script
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+      - name: Download verified release bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Verify and publish exact assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
+          PACKAGE_VERSION: ${{ needs.validate.outputs.version }}
+        run: python scripts/publish_release.py --dist dist --version "$PACKAGE_VERSION" --tag "$RELEASE_TAG" --repository "$GITHUB_REPOSITORY" --sha "$GITHUB_SHA"

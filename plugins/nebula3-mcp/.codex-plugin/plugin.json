@@ -1,0 +1,35 @@
+{
+  "name": "nebula3-mcp",
+  "version": "0.1.0",
+  "description": "Connect Codex to a NebulaGraph 3.8 graph database with read-only nGQL, structured analysis, and interactive graph results.",
+  "author": {
+    "name": "MuYiYong"
+  },
+  "repository": "https://github.com/MuYiYong/nebula3-mcp",
+  "license": "UNLICENSED",
+  "keywords": [
+    "nebulagraph",
+    "graph-database",
+    "ngql",
+    "mcp"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Nebula3 MCP",
+    "shortDescription": "NebulaGraph 3.8 nGQL 查询与交互式结果",
+    "longDescription": "在 Codex 中连接远端 NebulaGraph 3.8 图数据库，执行默认只读的 nGQL，并查看图、表格、图表、PROFILE、解释和实际执行语句。",
+    "developerName": "MuYiYong",
+    "category": "Developer Tools",
+    "capabilities": [
+      "MCP",
+      "Interactive Graph",
+      "Read-only by Default"
+    ],
+    "defaultPrompt": [
+      "测试 NebulaGraph 连接并列出图空间。",
+      "查询图数据，并同时展示图、图表和解释。",
+      "把我的自然语言需求转换为只读 nGQL 并执行。"
+    ],
+    "brandColor": "#3B82F6"
+  }
+}
