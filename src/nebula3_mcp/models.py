@@ -419,11 +419,30 @@ class ExplanationContext(BaseModel):
     suggested_focus: list[str] = Field(default_factory=list)
 
 
+class QueryHistoryEntry(BaseModel):
+    """One user statement sent in the current database session."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    seq: int = Field(ge=1)
+    statement: str = Field(description="nGQL as the user sees it; automatic PROFILE omitted.")
+    kind: Literal["query", "mutation", "use"]
+    space: str | None = None
+    ok: bool
+    code: str | None = None
+    executed_at: str = Field(description="UTC ISO-8601 timestamp.")
+    result_id: str | None = None
+
+
 class QueryOutput(BaseModel):
     """Unified read-only query output."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
+    result_id: str | None = Field(
+        None,
+        description="Pass this id to nebula_render_result instead of re-sending the result.",
+    )
     status: QueryStatus
     query: QueryMetadata
     profile: ProfileOutput | None = None
@@ -464,6 +483,10 @@ class QueryPresentation(BaseModel):
         description="Explain result meaning and insights with concrete entities, directions, values "
         "and comparisons. Distinguish facts from hypotheses and state sampling/missing-data limits. "
         "Do not merely repeat row or path counts.",
+    )
+    history: list[QueryHistoryEntry] = Field(
+        default_factory=list,
+        description="Statements sent in the current database session, oldest first.",
     )
 
 

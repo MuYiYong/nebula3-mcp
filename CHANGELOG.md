@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `nebula_render_result` now takes the `result_id` returned by `nebula_execute_query` / `nebula_select_space` and renders the server-held result. Previously the client relayed the whole result and could drop fields; a hand-rebuilt result lost PROFILE. A relayed `result` is still accepted, but a matching server copy takes precedence.
+- The MCP App "查询记录" tab lists every statement of the current database session (queries, `USE` from space selection, mutations; with time, space and status) and marks the current result, instead of only the current statement.
+
 ## 0.1.0
 
 - First release of the NebulaGraph 3.8 MCP server, ported from the YueShu 5.3 `nebula-mcp` architecture with a NebulaGraph 3.x interface layer: nebula3-python 3.8.3, nGQL, graph spaces, tags and edge types.

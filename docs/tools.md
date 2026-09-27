@@ -12,7 +12,7 @@
 | `nebula_select_space` | 在当前会话执行 `USE <space>`，自动续跑最近一条因缺少图空间而受阻的只读查询。 |
 | `nebula_validate_ngql` | 检查只读策略、占位符以及 GQL/Cypher 残留；可选 EXPLAIN，不执行原查询。 |
 | `nebula_execute_query` | 执行只读 nGQL，返回表格、图、图表、分析和 PROFILE。 |
-| `nebula_render_result` | 将已有结果和客户端撰写的解释展示为 MCP App；不额外查询数据库。 |
+| `nebula_render_result` | 按 `result_id` 取服务端保存的完整结果（含 PROFILE），与客户端撰写的解释及本会话查询记录一起展示为 MCP App；不额外查询数据库。 |
 | `nebula_execute_mutation` | 独立执行写入，必须启用 NEBULA_ALLOW_MUTATIONS 并逐次确认。 |
 
 校验、执行和展示承担不同职责，不是三次查询。生成 nGQL 和解释由客户端完成；MCP Server 本身不调用模型。显式 nGQL 不得为了生成图而改写，聚合查询也不应额外查询关系来补图。

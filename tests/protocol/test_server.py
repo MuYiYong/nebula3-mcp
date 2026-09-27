@@ -96,24 +96,60 @@ async def test_render_result_returns_identical_text_and_structured_content(
 ) -> None:
     async with Client(create_server(service=service)) as client:
         query = await client.call_tool("nebula_execute_query", {"statement": "RETURN 1"})
-        payload = deepcopy(query.structured_content)
-        payload["graph"]["space"] = "demo"
-        payload["graph"]["elements"]["nodes"] = [
-            {"data": {"id": "demo:9223372036854775807", "vid": "9223372036854775807",
-                      "space": "demo", "properties": {"player.name": "Alice"}}}
-        ]
         rendered = await client.call_tool(
-            "nebula_render_result", {"result": payload, "explanation": "查询返回 Alice 顶点。"},
-        )
-        scalar = await client.call_tool(
             "nebula_render_result",
-            {"result": query.structured_content, "explanation": "查询返回一行。"},
+            {"result_id": query.structured_content["result_id"], "explanation": "查询返回一行。"},
         )
 
     assert rendered.is_error is False
     assert json.loads(rendered.content[0].text) == rendered.structured_content
-    assert rendered.structured_content["result"] == payload
-    assert scalar.is_error is False
+    assert rendered.structured_content["result"] == query.structured_content
+
+
+@pytest.mark.anyio
+async def test_render_result_prefers_server_copy_over_client_rebuilt_result(
+    service: NebulaService,
+) -> None:
+    # Regression: a client re-typed the result by hand and dropped PROFILE.
+    async with Client(create_server(service=service)) as client:
+        query = await client.call_tool("nebula_execute_query", {"statement": "RETURN 1"})
+        payload = deepcopy(query.structured_content)
+        payload["profile"] = None
+        payload["result_id"] = None
+        payload["graph"]["elements"]["nodes"] = [
+            {"data": {"id": "demo:1", "vid": "1", "space": "demo", "properties": {}}}
+        ]
+        rebuilt = await client.call_tool(
+            "nebula_render_result", {"result": payload, "explanation": "查询返回一行。"},
+        )
+        missing = await client.call_tool(
+            "nebula_render_result", {"result_id": "nope", "explanation": "查询返回一行。"},
+        )
+
+    assert rebuilt.is_error is False
+    assert rebuilt.structured_content["result"] == query.structured_content
+    assert rebuilt.structured_content["result"]["profile"] is not None
+    assert missing.is_error is True
+    assert missing.structured_content["error"]["code"] == "RESULT_NOT_FOUND"
+
+
+@pytest.mark.anyio
+async def test_render_result_carries_session_query_history(service: NebulaService) -> None:
+    async with Client(create_server(service=service)) as client:
+        await client.call_tool("nebula_execute_query", {"statement": "RETURN 1"})
+        await client.call_tool("nebula_select_space", {"space": "demo"})
+        second = await client.call_tool("nebula_execute_query", {"statement": "RETURN 2"})
+        rendered = await client.call_tool(
+            "nebula_render_result",
+            {"result_id": second.structured_content["result_id"], "explanation": "返回一行。"},
+        )
+
+    history = rendered.structured_content["history"]
+    assert [(item["seq"], item["kind"], item["statement"]) for item in history] == [
+        (1, "query", "RETURN 1"), (2, "use", "USE `demo`"), (3, "query", "RETURN 2"),
+    ]
+    assert history[-1]["result_id"] == second.structured_content["result_id"]
+    assert all(item["ok"] for item in history)
 
 
 @pytest.mark.anyio

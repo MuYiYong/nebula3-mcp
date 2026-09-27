@@ -66,8 +66,10 @@ and pass their answer to nebula_select_space. It executes USE <space> and resume
 read-only query automatically; present its result without submitting the query again.
 Do not assume a space or retry an unrelated error as a space error. The user's space choice
 replaces the failed query's USE target; preserve its other clauses.
-Call nebula_render_result after a successful query or resumed query: non-empty graph data opens
-as an interactive graph; scalar or empty results open as a table. If MCP Apps are unavailable,
+Call nebula_render_result after a successful query or resumed query with its result_id and your
+explanation; do not re-send, rebuild or trim the result (the server keeps the full table, graph,
+charts and PROFILE, plus this session's query history). Non-empty graph data opens as an
+interactive graph; scalar or empty results open as a table. If MCP Apps are unavailable,
 show the returned table and available graph/chart specifications directly.
 If the user supplies explicit nGQL, validate and execute that statement unchanged; do not rewrite
 explicit nGQL merely to create a graph, and do not create a second visualization query. For a
@@ -293,16 +295,28 @@ def create_server(
     @server.tool(
         name="nebula_render_result",
         description=(
-            "Display a query result: vertices/edges open as an interactive graph, otherwise "
-            "open the table. Supply an evidence-based explanation of result meaning, specific "
-            "observations, insights and limitations, not only counts. Includes charts, PROFILE "
-            "and the actual nGQL."
+            "Display a query result by result_id (from nebula_execute_query or "
+            "nebula_select_space): vertices/edges open as an interactive graph, otherwise the "
+            "table. The server supplies the stored result (charts, PROFILE, actual nGQL) and "
+            "this session's query history; do not pass `result` unless no result_id exists. "
+            "Supply an evidence-based explanation of result meaning, specific observations, "
+            "insights and limitations, not only counts."
         ),
         annotations=READ_ONLY,
         meta={"ui": {"resourceUri": UI_RESOURCE_URI}},
     )
-    async def render_result(result: QueryOutput, explanation: str) -> QueryPresentation:
-        return QueryPresentation(result=result, explanation=explanation)
+    async def render_result(
+        explanation: str,
+        ctx: Context[RuntimeState, Any],
+        result_id: str | None = None,
+        result: QueryOutput | None = None,
+    ) -> QueryPresentation:
+        async def present() -> QueryPresentation:
+            if ctx.request_context.lifespan_context.service is None and result is not None:
+                return QueryPresentation(result=result, explanation=explanation)
+            return _service(ctx).presentation(explanation, result_id, result)
+
+        return await call(present)
 
     @server.tool(
         name="nebula_test_connection",

@@ -305,6 +305,32 @@ describe("graph properties and profile presentation", () => {
     button(root, "查询记录").click();
     expect(root.querySelector(".result-panel code")?.textContent).toBe("MATCH (v) RETURN v LIMIT 10");
   });
+
+  it("lists every statement of the session and marks the current result", () => {
+    const root = document.createElement("main");
+    const fake = fakeBridge();
+    const data = presentation("PROFILE MATCH (v) RETURN v LIMIT 10") as any;
+    data.structuredContent.result.result_id = "r2";
+    data.structuredContent.history = [
+      { seq: 1, statement: "MATCH (v) RETURN v LIMIT 10", kind: "query", space: null, ok: false,
+        code: "-1009", executed_at: "2026-09-27T09:25:01+00:00", result_id: null },
+      { seq: 2, statement: "USE `basketballplayer`", kind: "use", space: "basketballplayer",
+        ok: true, code: "0", executed_at: "2026-09-27T09:25:30+00:00", result_id: null },
+      { seq: 3, statement: "MATCH (v) RETURN v LIMIT 10", kind: "query", space: "basketballplayer",
+        ok: true, code: "0", executed_at: "2026-09-27T09:25:31+00:00", result_id: "r2" },
+    ];
+    mountApp(root, fake.bridge);
+    fake.emitResult(data);
+    button(root, "查询记录").click();
+    const items = Array.from(root.querySelectorAll<HTMLLIElement>(".history-list li"));
+    expect(items.map((item) => item.querySelector("code")?.textContent)).toEqual([
+      "MATCH (v) RETURN v LIMIT 10", "USE `basketballplayer`", "MATCH (v) RETURN v LIMIT 10",
+    ]);
+    expect(items[0].textContent).toContain("失败（-1009）");
+    expect(items[1].textContent).toContain("切换图空间");
+    expect(items[2].getAttribute("aria-current")).toBe("true");
+    expect(items.filter((item) => item.hasAttribute("aria-current"))).toHaveLength(1);
+  });
 });
 
 it("keeps large VIDs and ranks exact and omits internal element IDs", () => {

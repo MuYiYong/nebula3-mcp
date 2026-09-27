@@ -36,6 +36,7 @@ export interface ProfileOutput {
 }
 
 export interface QueryOutput {
+  result_id?: string | null;
   profile?: ProfileOutput | null;
   query: {
     statement: string;
@@ -55,7 +56,19 @@ export interface QueryOutput {
   truncation: { truncated: boolean; reasons: string[] };
 }
 
+export interface QueryHistoryEntry {
+  seq: number;
+  statement: string;
+  kind: "query" | "mutation" | "use";
+  space: string | null;
+  ok: boolean;
+  code: string | null;
+  executed_at: string;
+  result_id: string | null;
+}
+
 export interface QueryPresentation {
   result: QueryOutput;
   explanation: string;
+  history: QueryHistoryEntry[];
 }

@@ -157,6 +157,10 @@ button, select { font: inherit; }
 .result-panel ol { margin: 0; padding-left: 24px; }
 .result-panel ol li { padding: 8px 0; border-bottom: 1px solid var(--line); }
 .result-panel ol pre { margin: 0; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; }
+.history-meta { margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+.history-status { margin-left: 6px; padding: 0 6px; border: 1px solid var(--line); border-radius: 6px; }
+.history-failed { color: #b42318; }
+.result-panel ol li.history-current { border-left: 3px solid var(--accent); padding-left: 8px; }
 
 @media (max-width: 520px) {
   .query-result { gap: 14px; padding: 12px; }

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import re
+from collections import OrderedDict, deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Literal, Protocol
 from uuid import uuid4
 
@@ -18,9 +20,11 @@ from nebula3_mcp.models import (
     MutationInput,
     MutationOutput,
     ParsedResult,
+    QueryHistoryEntry,
     QueryInput,
     QueryMetadata,
     QueryOutput,
+    QueryPresentation,
     QueryStatus,
     ResultLimits,
     SchemaIndex,
@@ -52,6 +56,8 @@ from nebula3_mcp.specs import build_cytoscape_graph, build_vega_lite_specs
 _MISSING_SPACE_CODES = {-1009, -1005, -5}
 _MISSING_SPACE_MARKERS = ("Space was not chosen", "SpaceNotFound", "Space not found")
 _NAME_TOKEN = re.compile(r"`(?:[^`\\\n]|\\.)*`|[^\s;`#/]+")
+_HISTORY_LIMIT = 200
+_CACHED_RESULTS = 20
 _PLAN_PREFIX = re.compile(r'^\s*(?:EXPLAIN|PROFILE)\b(?:\s+FORMAT\s*=\s*"[^"\n]*")?', re.IGNORECASE)
 
 
@@ -123,6 +129,65 @@ class NebulaService:
         self.connection_id = uuid4().hex
         self.current_space: str | None = settings.default_space
         self.pending_query: QueryInput | None = None
+        # Session-scoped audit of user statements and recent results for nebula_render_result.
+        self.history: deque[QueryHistoryEntry] = deque(maxlen=_HISTORY_LIMIT)
+        self._history_seq = 0
+        self._results: OrderedDict[str, QueryOutput] = OrderedDict()
+
+    def _record(
+        self,
+        statement: str,
+        kind: Literal["query", "mutation", "use"],
+        status: QueryStatus,
+        result_id: str | None = None,
+        space: str | None = None,
+    ) -> None:
+        self._history_seq += 1
+        self.history.append(QueryHistoryEntry(
+            seq=self._history_seq,
+            statement=statement,
+            kind=kind,
+            space=space or status.space or self.current_space,
+            ok=status.ok,
+            code=status.code,
+            executed_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            result_id=result_id,
+        ))
+
+    def _remember(self, output: QueryOutput) -> None:
+        assert output.result_id is not None
+        self._results[output.result_id] = output
+        while len(self._results) > _CACHED_RESULTS:
+            self._results.popitem(last=False)
+
+    def presentation(
+        self,
+        explanation: str,
+        result_id: str | None = None,
+        result: QueryOutput | None = None,
+    ) -> QueryPresentation:
+        """Pair the server-held result (never a client re-typed copy) with session history."""
+        chosen = self._results.get(result_id) if result_id else None
+        if chosen is None and result is not None:
+            chosen = self._results.get(result.result_id or "") or next(
+                (
+                    cached for cached in reversed(self._results.values())
+                    if cached.query.executed_statement == result.query.executed_statement
+                    or cached.query.statement == result.query.statement
+                ),
+                result,
+            )
+        if chosen is None:
+            raise NebulaMCPError(
+                category="validation_error",
+                code="RESULT_NOT_FOUND",
+                message="查询结果已过期或不存在，请重新执行查询。",
+                suggestion="Pass result_id from the latest nebula_execute_query or "
+                "nebula_select_space result",
+            )
+        return QueryPresentation(
+            result=chosen, explanation=explanation, history=list(self.history)
+        )
 
     async def _run(self, statement: str) -> ResultLike:
         """Execute in the retained session and track the session space graphd reports."""
@@ -138,6 +203,7 @@ class NebulaService:
         """Select the session space and resume the last query blocked by a missing space."""
         _require_space(space)
         check = await self._use(space)
+        self._record(f"USE {quote_name(space)}", "use", status_of(check))
         if check.error_code != SUCCEEDED:
             raise NebulaMCPError(
                 category="database_error",
@@ -355,6 +421,7 @@ class NebulaService:
         if raw_result is None or raw_result.error_code == SUCCEEDED:
             raw_result = await self._run(executed_statement)
         if is_missing_space(raw_result):
+            self._record(display_statement, "query", status_of(raw_result))
             self.pending_query = request
             raise NebulaMCPError(
                 category="database_error",
@@ -382,7 +449,8 @@ class NebulaService:
             else []
         )
         output_analysis = analysis if request.include_analysis else None
-        return QueryOutput(
+        output = QueryOutput(
+            result_id=uuid4().hex,
             status=parsed.status,
             query=QueryMetadata(
                 statement=request.statement,
@@ -402,6 +470,11 @@ class NebulaService:
             explanation_context=self._explanation_context(parsed, executed_evidence),
             truncation=parsed.truncation,
         )
+        self._remember(output)
+        self._record(
+            display_statement, "query", parsed.status, output.result_id, effective_space
+        )
+        return output
 
     async def execute_mutation(self, request: MutationInput) -> MutationOutput:
         if not self.settings.allow_mutations:
@@ -427,8 +500,10 @@ class NebulaService:
             )
         statement = self._apply_space(request.statement, request.space)
         result = await self._run(statement)
+        status = status_of(result)
+        self._record(statement, "mutation", status)
         return MutationOutput(
-            status=status_of(result),
+            status=status,
             executed_statement=statement,
             warnings=("This tool executed a database mutation.",),
         )

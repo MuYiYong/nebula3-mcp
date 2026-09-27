@@ -13,6 +13,7 @@ import type {
   GraphElement,
   GraphElements,
   GraphSpec,
+  QueryHistoryEntry,
   QueryPresentation,
   QueryOutput,
   ProfileOutput,
@@ -28,7 +29,7 @@ interface AppState {
   selectedTab: TabLabel;
   selectedElementId: string | null;
   layout: GraphLayout;
-  ngqlHistory: string[];
+  history: QueryHistoryEntry[];
   profiles: (ProfileOutput | null | undefined)[];
   graphView: GraphView | null;
 }
@@ -56,7 +57,7 @@ export function mountApp(root: HTMLElement, bridge: McpBridge): AppController {
       selectedTab: hasGraphElements(elements) ? "图" : "表格",
       selectedElementId: null,
       layout: "cose",
-      ngqlHistory: [displayNgql(presentation.result.query)],
+      history: presentation.history,
       profiles: [presentation.result.profile],
       graphView: null,
     };
@@ -141,7 +142,7 @@ export function mountApp(root: HTMLElement, bridge: McpBridge): AppController {
     } else if (state.selectedTab === "人工解释") {
       renderExplanation(panel, state.presentation.explanation);
     } else {
-      renderHistory(panel, state.ngqlHistory);
+      renderHistory(panel, state.presentation);
     }
     article.append(panel);
     root.replaceChildren(article);
@@ -322,18 +323,64 @@ function elementIdentity(element: GraphElement): [string, string][] {
   return rows;
 }
 
-function renderHistory(container: HTMLElement, statements: string[]): void {
+const HISTORY_KIND_LABELS: Record<QueryHistoryEntry["kind"], string> = {
+  query: "查询",
+  mutation: "写入",
+  use: "切换图空间",
+};
+
+function renderHistory(container: HTMLElement, presentation: QueryPresentation): void {
+  const current = presentation.result;
+  // Results from older servers carry no session history: fall back to the current statement.
+  const entries: QueryHistoryEntry[] = presentation.history.length > 0
+    ? presentation.history
+    : [{
+      seq: 1, statement: displayNgql(current.query), kind: "query", space: current.query.space,
+      ok: true, code: null, executed_at: "", result_id: current.result_id ?? null,
+    }];
+  const currentId = current.result_id ?? null;
   const list = document.createElement("ol");
-  for (const statement of statements) {
+  list.className = "history-list";
+  list.setAttribute("aria-label", "本会话查询记录");
+  for (const entry of entries) {
     const item = document.createElement("li");
+    item.value = entry.seq;
+    const isCurrent = currentId !== null
+      ? entry.result_id === currentId
+      : entry === entries[entries.length - 1];
+    if (isCurrent) {
+      item.className = "history-current";
+      item.setAttribute("aria-current", "true");
+    }
+    const meta = document.createElement("div");
+    meta.className = "history-meta";
+    const parts = [HISTORY_KIND_LABELS[entry.kind]];
+    if (entry.executed_at) parts.push(formatHistoryTime(entry.executed_at));
+    if (entry.space) parts.push(`图空间：${entry.space}`);
+    meta.append(parts.join(" · "));
+    const status = document.createElement("span");
+    status.className = entry.ok ? "history-status" : "history-status history-failed";
+    status.textContent = entry.ok ? "成功" : `失败${entry.code ? `（${entry.code}）` : ""}`;
+    meta.append(" ", status);
+    if (isCurrent) {
+      const marker = document.createElement("span");
+      marker.className = "history-status";
+      marker.textContent = "当前结果";
+      meta.append(" ", marker);
+    }
     const pre = document.createElement("pre");
     const code = document.createElement("code");
-    code.textContent = statement;
+    code.textContent = entry.statement;
     pre.append(code);
-    item.append(pre);
+    item.append(meta, pre);
     list.append(item);
   }
   container.replaceChildren(list);
+}
+
+function formatHistoryTime(value: string): string {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString();
 }
 
 function actionButton(label: string, action: () => void): HTMLButtonElement {
@@ -362,7 +409,9 @@ function parsePresentation(params: unknown): QueryPresentation | null {
     return null;
   }
   return {
+    history: normalizeHistory(content.history),
     result: {
+      result_id: typeof result.result_id === "string" ? result.result_id : null,
       query: {
         statement: typeof result.query.statement === "string" ? result.query.statement : "",
         executed_statement: result.query.executed_statement,
@@ -388,6 +437,24 @@ function parsePresentation(params: unknown): QueryPresentation | null {
     },
     explanation: content.explanation,
   };
+}
+
+function normalizeHistory(value: unknown): QueryHistoryEntry[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter(isRecord).flatMap((item) => {
+    if (typeof item.statement !== "string" || typeof item.seq !== "number") return [];
+    const kind = item.kind === "mutation" || item.kind === "use" ? item.kind : "query";
+    return [{
+      seq: item.seq,
+      statement: item.statement,
+      kind,
+      space: typeof item.space === "string" ? item.space : null,
+      ok: item.ok !== false,
+      code: typeof item.code === "string" ? item.code : null,
+      executed_at: typeof item.executed_at === "string" ? item.executed_at : "",
+      result_id: typeof item.result_id === "string" ? item.result_id : null,
+    }];
+  });
 }
 
 function normalizeTable(value: unknown): TableResult | null {
